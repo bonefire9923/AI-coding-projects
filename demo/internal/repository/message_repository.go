@@ -1,8 +1,10 @@
 package repository
 
 import (
+	"encoding/json"
 	"errors"
-	"sort"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -14,8 +16,9 @@ var ErrNotFound = errors.New("not found")
 
 type MessageRepository interface {
 	CreateMessage(msg model.Message) (model.Message, error)
-	FindByClientMsgID(senderID int64, clientMsgID string) (model.Message, error)
+	FindByClientMsgID(senderID int64, conversationID int64, clientMsgID string) (model.Message, error)
 	GetMessage(id int64) (model.Message, error)
+	GetAttempt(id int64) (model.DeliveryAttempt, error)
 	SaveMessage(msg model.Message) (model.Message, error)
 	StartAttempt(messageID int64, providerTraceID string) (model.DeliveryAttempt, error)
 	CompleteAttempt(attemptID int64, success bool, errorCode string) (model.Message, error)
@@ -37,24 +40,58 @@ type MemoryMessageRepository struct {
 	nextAttemptID int64
 	nextEventSeq  int64
 
-	messages      map[int64]model.Message
-	attempts      map[int64]model.DeliveryAttempt
-	events        []model.SyncEvent
-	summaries     map[string]model.ConversationSummary
-	deviceCursors map[string]int64
+	messages             map[int64]model.Message
+	attempts             map[int64]model.DeliveryAttempt
+	events               []model.SyncEvent
+	userEvents           map[int64][]model.SyncEvent
+	summaries            map[string]model.ConversationSummary
+	deviceCursors        map[string]int64
+	clientMsgIndex       map[string]int64
+	conversationMessages map[int64][]int64
+	persistPath          string
 }
 
 func NewMemoryMessageRepository() *MemoryMessageRepository {
-	return &MemoryMessageRepository{
-		nextMessageID: 1,
-		nextAttemptID: 1,
-		nextEventSeq:  1,
-		messages:      make(map[int64]model.Message),
-		attempts:      make(map[int64]model.DeliveryAttempt),
-		events:        make([]model.SyncEvent, 0),
-		summaries:     make(map[string]model.ConversationSummary),
-		deviceCursors: make(map[string]int64),
+	return newMemoryMessageRepository("")
+}
+
+func NewFileMessageRepository(path string) (*MemoryMessageRepository, error) {
+	repo := newMemoryMessageRepository(path)
+	if err := repo.loadFromDisk(); err != nil {
+		return nil, err
 	}
+	return repo, nil
+}
+
+func newMemoryMessageRepository(persistPath string) *MemoryMessageRepository {
+	return &MemoryMessageRepository{
+		nextMessageID:        1,
+		nextAttemptID:        1,
+		nextEventSeq:         1,
+		messages:             make(map[int64]model.Message),
+		attempts:             make(map[int64]model.DeliveryAttempt),
+		events:               make([]model.SyncEvent, 0),
+		userEvents:           make(map[int64][]model.SyncEvent),
+		summaries:            make(map[string]model.ConversationSummary),
+		deviceCursors:        make(map[string]int64),
+		clientMsgIndex:       make(map[string]int64),
+		conversationMessages: make(map[int64][]int64),
+		persistPath:          persistPath,
+	}
+}
+
+type repositorySnapshot struct {
+	NextMessageID        int64                                `json:"next_message_id"`
+	NextAttemptID        int64                                `json:"next_attempt_id"`
+	NextEventSeq         int64                                `json:"next_event_seq"`
+	Messages             map[int64]model.Message              `json:"messages"`
+	Attempts             map[int64]model.DeliveryAttempt      `json:"attempts"`
+	Events               []model.SyncEvent                    `json:"events"`
+	UserEvents           map[int64][]model.SyncEvent          `json:"user_events"`
+	Summaries            map[string]model.ConversationSummary `json:"summaries"`
+	DeviceCursors        map[string]int64                     `json:"device_cursors"`
+	ClientMsgIndex       map[string]int64                     `json:"client_msg_index"`
+	ConversationMessages map[int64][]int64                    `json:"conversation_messages"`
 }
 
 func summaryKey(userID, conversationID int64) string {
@@ -63,6 +100,10 @@ func summaryKey(userID, conversationID int64) string {
 
 func deviceKey(userID int64, deviceID string) string {
 	return strconv.FormatInt(userID, 10) + ":" + deviceID
+}
+
+func clientMsgKey(senderID int64, conversationID int64, clientMsgID string) string {
+	return strconv.FormatInt(senderID, 10) + ":" + strconv.FormatInt(conversationID, 10) + ":" + clientMsgID
 }
 
 func (r *MemoryMessageRepository) CreateMessage(msg model.Message) (model.Message, error) {
@@ -79,22 +120,32 @@ func (r *MemoryMessageRepository) CreateMessage(msg model.Message) (model.Messag
 	}
 	msg.Version = 1
 	r.messages[msg.ID] = msg
+	r.conversationMessages[msg.ConversationID] = append(r.conversationMessages[msg.ConversationID], msg.ID)
+	if msg.ClientMsgID != "" {
+		r.clientMsgIndex[clientMsgKey(msg.SenderID, msg.ConversationID, msg.ClientMsgID)] = msg.ID
+	}
 
 	r.appendEventLocked(msg.SenderID, msg, model.EventTypeMessageCreated)
 	r.updateSummaryLocked(msg.SenderID, msg, false)
+	if err := r.persistLocked(); err != nil {
+		return model.Message{}, err
+	}
 	return msg, nil
 }
 
-func (r *MemoryMessageRepository) FindByClientMsgID(senderID int64, clientMsgID string) (model.Message, error) {
+func (r *MemoryMessageRepository) FindByClientMsgID(senderID int64, conversationID int64, clientMsgID string) (model.Message, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for _, msg := range r.messages {
-		if msg.SenderID == senderID && msg.ClientMsgID == clientMsgID {
-			return msg, nil
-		}
+	msgID, ok := r.clientMsgIndex[clientMsgKey(senderID, conversationID, clientMsgID)]
+	if !ok {
+		return model.Message{}, ErrNotFound
 	}
-	return model.Message{}, ErrNotFound
+	msg, ok := r.messages[msgID]
+	if !ok {
+		return model.Message{}, ErrNotFound
+	}
+	return msg, nil
 }
 
 func (r *MemoryMessageRepository) GetMessage(id int64) (model.Message, error) {
@@ -106,6 +157,17 @@ func (r *MemoryMessageRepository) GetMessage(id int64) (model.Message, error) {
 		return model.Message{}, ErrNotFound
 	}
 	return msg, nil
+}
+
+func (r *MemoryMessageRepository) GetAttempt(id int64) (model.DeliveryAttempt, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	att, ok := r.attempts[id]
+	if !ok {
+		return model.DeliveryAttempt{}, ErrNotFound
+	}
+	return att, nil
 }
 
 func (r *MemoryMessageRepository) SaveMessage(msg model.Message) (model.Message, error) {
@@ -121,6 +183,9 @@ func (r *MemoryMessageRepository) SaveMessage(msg model.Message) (model.Message,
 	r.messages[msg.ID] = msg
 	r.appendEventLocked(msg.SenderID, msg, model.EventTypeMessageUpdated)
 	r.appendEventLocked(msg.ReceiverID, msg, model.EventTypeMessageUpdated)
+	if err := r.persistLocked(); err != nil {
+		return model.Message{}, err
+	}
 	return msg, nil
 }
 
@@ -156,6 +221,9 @@ func (r *MemoryMessageRepository) StartAttempt(messageID int64, providerTraceID 
 	msg.UpdatedAt = time.Now()
 	r.messages[msg.ID] = msg
 	r.appendEventLocked(msg.SenderID, msg, model.EventTypeMessageUpdated)
+	if err := r.persistLocked(); err != nil {
+		return model.DeliveryAttempt{}, err
+	}
 	return att, nil
 }
 
@@ -170,6 +238,12 @@ func (r *MemoryMessageRepository) CompleteAttempt(attemptID int64, success bool,
 	msg, ok := r.messages[att.MessageID]
 	if !ok {
 		return model.Message{}, ErrNotFound
+	}
+	if att.FinishedAt != nil {
+		return msg, nil
+	}
+	if msg.ActiveAttemptID != attemptID {
+		return msg, nil
 	}
 
 	now := time.Now()
@@ -193,6 +267,9 @@ func (r *MemoryMessageRepository) CompleteAttempt(attemptID int64, success bool,
 	if success {
 		r.updateSummaryLocked(msg.ReceiverID, msg, true)
 	}
+	if err := r.persistLocked(); err != nil {
+		return model.Message{}, err
+	}
 	return msg, nil
 }
 
@@ -209,6 +286,9 @@ func (r *MemoryMessageRepository) SetLegacyDisplayStatus(messageID int64, status
 	msg.Version++
 	r.messages[msg.ID] = msg
 	// Compatibility path intentionally updates list display without producing a sync event.
+	if err := r.persistLocked(); err != nil {
+		return model.Message{}, err
+	}
 	return msg, nil
 }
 
@@ -227,6 +307,9 @@ func (r *MemoryMessageRepository) DeleteMessage(messageID int64) (model.Message,
 	msg.Version++
 	r.messages[msg.ID] = msg
 	r.appendEventLocked(msg.SenderID, msg, model.EventTypeMessageDeleted)
+	if err := r.persistLocked(); err != nil {
+		return model.Message{}, err
+	}
 	return msg, nil
 }
 
@@ -235,17 +318,19 @@ func (r *MemoryMessageRepository) ListConversationMessages(conversationID int64,
 	defer r.mu.Unlock()
 
 	items := make([]model.Message, 0)
-	for _, msg := range r.messages {
-		if msg.ConversationID == conversationID && msg.Status != model.MessageStatusDeleted {
+	ids := r.conversationMessages[conversationID]
+	for i := len(ids) - 1; i >= 0; i-- {
+		msg, ok := r.messages[ids[i]]
+		if !ok {
+			continue
+		}
+		if msg.Status != model.MessageStatusDeleted {
 			if msg.LegacyStatus != "" {
 				msg.Status = msg.LegacyStatus
 			}
 			items = append(items, msg)
 		}
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].CreatedAt.After(items[j].CreatedAt)
-	})
 	if offset >= len(items) {
 		return []model.Message{}, nil
 	}
@@ -291,6 +376,9 @@ func (r *MemoryMessageRepository) MarkConversationRead(userID int64, conversatio
 	s.UnreadCount = 0
 	s.UpdatedAt = time.Now()
 	r.summaries[key] = s
+	if err := r.persistLocked(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -299,12 +387,11 @@ func (r *MemoryMessageRepository) ListEventsAfter(userID int64, cursor int64) ([
 	defer r.mu.Unlock()
 
 	items := make([]model.SyncEvent, 0)
-	for _, ev := range r.events {
-		if ev.UserID == userID && ev.Seq > cursor {
+	for _, ev := range r.userEvents[userID] {
+		if ev.Seq > cursor {
 			items = append(items, ev)
 		}
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Seq < items[j].Seq })
 	return items, nil
 }
 
@@ -318,6 +405,7 @@ func (r *MemoryMessageRepository) SaveDeviceCursor(userID int64, deviceID string
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deviceCursors[deviceKey(userID, deviceID)] = cursor
+	_ = r.persistLocked()
 }
 
 func (r *MemoryMessageRepository) appendEventLocked(userID int64, msg model.Message, eventType string) {
@@ -336,6 +424,7 @@ func (r *MemoryMessageRepository) appendEventLocked(userID int64, msg model.Mess
 	}
 	r.nextEventSeq++
 	r.events = append(r.events, ev)
+	r.userEvents[userID] = append(r.userEvents[userID], ev)
 }
 
 func (r *MemoryMessageRepository) updateSummaryLocked(userID int64, msg model.Message, incrementUnread bool) {
@@ -353,4 +442,99 @@ func (r *MemoryMessageRepository) updateSummaryLocked(userID int64, msg model.Me
 	}
 	s.UpdatedAt = time.Now()
 	r.summaries[key] = s
+}
+
+func (r *MemoryMessageRepository) persistLocked() error {
+	if r.persistPath == "" {
+		return nil
+	}
+	s := repositorySnapshot{
+		NextMessageID:        r.nextMessageID,
+		NextAttemptID:        r.nextAttemptID,
+		NextEventSeq:         r.nextEventSeq,
+		Messages:             r.messages,
+		Attempts:             r.attempts,
+		Events:               r.events,
+		UserEvents:           r.userEvents,
+		Summaries:            r.summaries,
+		DeviceCursors:        r.deviceCursors,
+		ClientMsgIndex:       r.clientMsgIndex,
+		ConversationMessages: r.conversationMessages,
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(r.persistPath), 0o755); err != nil {
+		return err
+	}
+	tmp := r.persistPath + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, r.persistPath)
+}
+
+func (r *MemoryMessageRepository) loadFromDisk() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.persistPath == "" {
+		return nil
+	}
+	b, err := os.ReadFile(r.persistPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var s repositorySnapshot
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	r.nextMessageID = s.NextMessageID
+	r.nextAttemptID = s.NextAttemptID
+	r.nextEventSeq = s.NextEventSeq
+	r.messages = s.Messages
+	r.attempts = s.Attempts
+	r.events = s.Events
+	r.userEvents = s.UserEvents
+	r.summaries = s.Summaries
+	r.deviceCursors = s.DeviceCursors
+	r.clientMsgIndex = s.ClientMsgIndex
+	r.conversationMessages = s.ConversationMessages
+	if r.messages == nil {
+		r.messages = make(map[int64]model.Message)
+	}
+	if r.attempts == nil {
+		r.attempts = make(map[int64]model.DeliveryAttempt)
+	}
+	if r.events == nil {
+		r.events = make([]model.SyncEvent, 0)
+	}
+	if r.userEvents == nil {
+		r.userEvents = make(map[int64][]model.SyncEvent)
+	}
+	if r.summaries == nil {
+		r.summaries = make(map[string]model.ConversationSummary)
+	}
+	if r.deviceCursors == nil {
+		r.deviceCursors = make(map[string]int64)
+	}
+	if r.clientMsgIndex == nil {
+		r.clientMsgIndex = make(map[string]int64)
+	}
+	if r.conversationMessages == nil {
+		r.conversationMessages = make(map[int64][]int64)
+	}
+	if r.nextMessageID <= 0 {
+		r.nextMessageID = 1
+	}
+	if r.nextAttemptID <= 0 {
+		r.nextAttemptID = 1
+	}
+	if r.nextEventSeq <= 0 {
+		r.nextEventSeq = 1
+	}
+	return nil
 }
